@@ -1,0 +1,175 @@
+
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>Fake News Detection</title>
+
+    <link rel="stylesheet"
+    href="{{ url_for('static', filename='style.css') }}">
+</head>
+
+<body>
+
+    <div class="container">
+
+        <header>
+            <h1>📰 Fake News Detection</h1>
+            <p>AI-powered News Verification System</p>
+        </header>
+
+        <div class="card">
+
+            <h2>Verify Your News</h2>
+
+            <p>Enter a news headline or statement below.</p>
+
+            <textarea
+                id="newsInput"
+                placeholder="Enter news here..."
+                rows="6"></textarea>
+
+            <button id="checkButton" onclick="checkNews()">
+                Check News
+            </button>
+
+            <p id="loading" class="hidden">
+                Checking news...
+            </p>
+
+            <div id="result" class="hidden">
+
+                <h2 id="status"></h2>
+
+                <p id="message"></p>
+
+                <div id="reviews"></div>
+
+            </div>
+
+        </div>
+
+        <footer>
+            Fake News Detection | Powered by Google Fact Check API
+        </footer>
+
+    </div>
+
+    <script>
+
+        async function checkNews() {
+
+            const news = document.getElementById("newsInput")
+                .value.trim();
+
+            const result = document.getElementById("result");
+            const loading = document.getElementById("loading");
+            const button = document.getElementById("checkButton");
+
+            if (news.length < 5) {
+                alert("Please enter valid news.");
+                return;
+            }
+
+            result.classList.add("hidden");
+            loading.classList.remove("hidden");
+            button.disabled = true;
+
+            try {
+
+                const response = await fetch("/api/check", {
+
+                    method: "POST",
+
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+
+                    body: JSON.stringify({
+                        news: news
+                    })
+
+                });
+
+                const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(data.error || "Request failed");
+                }
+
+                document.getElementById("status").textContent =
+                    data.status;
+
+                document.getElementById("status").className =
+                    data.status.toLowerCase();
+
+                document.getElementById("message").textContent =
+                    data.message;
+
+                const reviews =
+                    document.getElementById("reviews");
+
+                reviews.innerHTML = "";
+
+                data.reviews.forEach(review => {
+
+                    const card = document.createElement("div");
+                    card.className = "review-card";
+
+                    const title = document.createElement("h3");
+                    title.textContent = review.title;
+
+                    const claim = document.createElement("p");
+                    claim.textContent = "Claim: " + review.claim;
+
+                    const rating = document.createElement("p");
+                    rating.textContent = "Rating: " + review.rating;
+
+                    const publisher = document.createElement("p");
+                    publisher.textContent =
+                        "Publisher: " + review.publisher;
+
+                    card.append(title, claim, rating, publisher);
+
+                    if (review.url) {
+
+                        const link = document.createElement("a");
+
+                        link.href = review.url;
+                        link.target = "_blank";
+                        link.rel = "noopener noreferrer";
+                        link.textContent = "Read Fact Check";
+
+                        card.appendChild(link);
+                    }
+
+                    reviews.appendChild(card);
+
+                });
+
+                result.classList.remove("hidden");
+
+            }
+
+            catch(error) {
+
+                alert(error.message);
+
+            }
+
+            finally {
+
+                loading.classList.add("hidden");
+                button.disabled = false;
+
+            }
+
+        }
+
+    </script>
+
+</body>
+</html>
