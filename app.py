@@ -2,11 +2,12 @@
 from flask import Flask, render_template, request, jsonify
 from google import genai
 from google.genai import types
+from dotenv import load_dotenv
+
 import requests
 import os
 import json
 import re
-from dotenv import load_dotenv
 
 # ------------------------------------------
 # 1. INITIALIZATION
@@ -26,15 +27,11 @@ FACT_CHECK_URL = (
 
 GEMINI_MODEL = "gemini-3.8-flash"
 
-# Create Gemini client
 client = None
 
 if GEMINI_KEY:
     client = genai.Client(
-        api_key=GEMINI_KEY,
-        http_options=types.HttpOptions(
-            api_version="v1beta"
-        )
+        api_key=GEMINI_KEY
     )
 
 
@@ -151,14 +148,58 @@ def extract_sources(response):
 
 
 # ------------------------------------------
-# 4. GEMINI AI NEWS VERIFICATION
+# 4. EXTRACT JSON RESPONSE
+# ------------------------------------------
+
+def extract_json(response_text):
+
+    if not response_text:
+        raise ValueError("Empty response received from Gemini.")
+
+    # Remove Markdown code fences if present
+    cleaned = re.sub(
+        r"```(?:json)?",
+        "",
+        response_text,
+        flags=re.IGNORECASE
+    ).strip()
+
+    cleaned = cleaned.replace("```", "").strip()
+
+    try:
+        return json.loads(cleaned)
+
+    except json.JSONDecodeError:
+
+        # Find the first valid JSON object
+        decoder = json.JSONDecoder()
+
+        start = cleaned.find("{")
+
+        if start == -1:
+            raise ValueError(
+                "Gemini did not return a valid JSON response."
+            )
+
+        try:
+            result, _ = decoder.raw_decode(cleaned[start:])
+            return result
+
+        except json.JSONDecodeError:
+            raise ValueError(
+                "Unable to extract valid JSON from Gemini response."
+            )
+
+
+# ------------------------------------------
+# 5. GEMINI AI NEWS VERIFICATION
 # ------------------------------------------
 
 def verify_with_gemini(news, fact_checks):
 
     if client is None:
         raise ValueError(
-            "Gemini API key is missing in Render Environment."
+            "Gemini API key is missing."
         )
 
     fact_check_data = json.dumps(
@@ -169,7 +210,7 @@ def verify_with_gemini(news, fact_checks):
     prompt = f"""
 You are a professional news fact-checking assistant.
 
-Verify the exact factual statement provided below.
+Your task is to verify the exact factual statement.
 
 NEWS STATEMENT:
 {news}
@@ -177,16 +218,17 @@ NEWS STATEMENT:
 EXISTING GOOGLE FACT CHECK RESULTS:
 {fact_check_data}
 
-YOUR TASK:
+INSTRUCTIONS:
 
 1. Investigate the exact news statement.
 2. Use Google Search grounding to find reliable evidence.
-3. Prefer official government sources and established
+3. Prefer official government websites and established
    news organizations.
-4. Compare the claim with the evidence.
+4. Compare the claim with available evidence.
 5. Do not confuse a related claim with the exact claim.
-6. Do not blindly trust an unrelated fact-check result.
+6. Do not blindly trust unrelated fact-check results.
 7. Never invent evidence or source links.
+8. If the information is insufficient, return UNVERIFIED.
 
 VERDICT RULES:
 
@@ -197,19 +239,20 @@ FAKE:
 Reliable evidence clearly contradicts the central claim.
 
 UNVERIFIED:
-Evidence is insufficient, ambiguous or contradictory.
+Evidence is insufficient, ambiguous, or contradictory.
 
-Return only a valid JSON object:
+Return ONLY a valid JSON object in this format:
 
 {{
-  "verdict": "TRUE",
-  "confidence": 95,
-  "explanation": "A short explanation based on evidence.",
-  "checked_claim": "The exact claim that was checked"
+    "verdict": "TRUE",
+    "confidence": 95,
+    "explanation": "A short explanation based on evidence.",
+    "checked_claim": "The exact claim that was checked"
 }}
 
-The verdict must be TRUE, FAKE or UNVERIFIED.
+The verdict must be TRUE, FAKE, or UNVERIFIED.
 Confidence must be a number between 0 and 100.
+Do not include Markdown or additional text.
 """
 
     response = client.models.generate_content(
@@ -220,27 +263,19 @@ Confidence must be a number between 0 and 100.
                 types.Tool(
                     google_search=types.GoogleSearch()
                 )
-            ],
-            temperature=0.2
+            ]
         )
     )
 
     response_text = response.text or ""
 
-    # Extract JSON response
-    match = re.search(
-        r"\{.*\}",
-        response_text,
-        re.DOTALL
-    )
+    print("\n========== GEMINI RAW RESPONSE ==========")
+    print(response_text)
 
-    if not match:
-        raise ValueError(
-            "Gemini did not return a valid JSON response."
-        )
+    # Extract JSON
+    result = extract_json(response_text)
 
-    result = json.loads(match.group())
-
+    # Validate verdict
     verdict = str(
         result.get("verdict", "UNVERIFIED")
     ).upper().strip()
@@ -248,13 +283,20 @@ Confidence must be a number between 0 and 100.
     if verdict not in ["TRUE", "FAKE", "UNVERIFIED"]:
         verdict = "UNVERIFIED"
 
+    # Validate confidence
     try:
+
         confidence = float(
             result.get("confidence", 0)
         )
-        confidence = max(0, min(100, confidence))
+
+        confidence = max(
+            0,
+            min(100, confidence)
+        )
 
     except (ValueError, TypeError):
+
         confidence = 0
 
     explanation = str(
@@ -268,18 +310,22 @@ Confidence must be a number between 0 and 100.
         result.get("checked_claim", "")
     )
 
+    # Extract Google Search sources
     sources = extract_sources(response)
 
-    # Require search evidence for a definite result
+    # Require search evidence for definite results
     if not sources:
+
         verdict = "UNVERIFIED"
+
         explanation += (
             " No Google Search grounding sources were returned. "
-            "The claim requires manual verification."
+            "Manual verification is recommended."
         )
 
     # Avoid definite results with low confidence
     if confidence < 70:
+
         verdict = "UNVERIFIED"
 
     return {
@@ -292,7 +338,7 @@ Confidence must be a number between 0 and 100.
 
 
 # ------------------------------------------
-# 5. HOME PAGE
+# 6. HOME PAGE
 # ------------------------------------------
 
 @app.route("/")
@@ -302,7 +348,7 @@ def home():
 
 
 # ------------------------------------------
-# 6. CHECK NEWS ROUTE
+# 7. CHECK NEWS ROUTE
 # ------------------------------------------
 
 @app.route("/api/check", methods=["POST"])
@@ -310,8 +356,9 @@ def check_news():
 
     data = request.get_json(silent=True) or {}
 
-    news = data.get("news", "").strip()
+    news = str(data.get("news", "")).strip()
 
+    # Validate input
     if len(news) < 10:
 
         return jsonify({
@@ -340,6 +387,7 @@ def check_news():
         print("REVIEWS FOUND:", len(reviews))
 
         for review in reviews:
+
             print("CLAIM:", review["claim"])
             print("RATING:", review["rating"])
             print("PUBLISHER:", review["publisher"])
@@ -393,31 +441,42 @@ def check_news():
         error_text = str(error).lower()
 
         if "429" in error_text or "resource_exhausted" in error_text:
+
             return jsonify({
-            "error": "Gemini API daily quota exceeded. Please try again after the quota resets."
+                "error": (
+                    "Gemini API quota exceeded. "
+                    "Please try again after the quota resets."
+                )
             }), 429
 
         return jsonify({
-        "error": "AI verification failed. Please check Render application logs."
+            "error": (
+                "AI verification failed. "
+                "Please check Render application logs."
+            )
         }), 500
 
 
 # ------------------------------------------
-# 7. HEALTH CHECK
+# 8. HEALTH CHECK
 # ------------------------------------------
 
 @app.route("/health")
 def health():
 
     return jsonify({
+
         "status": "running",
+
         "gemini_configured": bool(GEMINI_KEY),
+
         "fact_check_configured": bool(FACT_CHECK_KEY)
+
     })
 
 
 # ------------------------------------------
-# 8. RUN APPLICATION
+# 9. RUN APPLICATION
 # ------------------------------------------
 
 if __name__ == "__main__":
