@@ -390,11 +390,15 @@ def check_news():
 
         print("VERIFICATION ERROR:", repr(error))
 
+        error_text = str(error).lower()
+
+        if "429" in error_text or "resource_exhausted" in error_text:
+            return jsonify({
+            "error": "Gemini API daily quota exceeded. Please try again after the quota resets."
+            }), 429
+
         return jsonify({
-            "error": (
-                "AI verification failed. "
-                "Please check Render application logs."
-            )
+        "error": "AI verification failed. Please check Render application logs."
         }), 500
 
 
