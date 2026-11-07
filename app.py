@@ -24,7 +24,7 @@ FACT_CHECK_URL = (
     "v1alpha1/claims:search"
 )
 
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.8-flash"
 
 # Create Gemini client
 client = None
