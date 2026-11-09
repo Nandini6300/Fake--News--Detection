@@ -8,6 +8,9 @@ import requests
 import os
 import json
 import re
+import time
+import hashlib
+import threading
 
 # ------------------------------------------
 # 1. INITIALIZATION
@@ -20,23 +23,71 @@ app = Flask(__name__)
 FACT_CHECK_KEY = os.getenv("GOOGLE_FACT_CHECK_API_KEY")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 
+GEMINI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-3.8-flash"
+)
+
 FACT_CHECK_URL = (
     "https://factchecktools.googleapis.com/"
     "v1alpha1/claims:search"
 )
 
-GEMINI_MODEL = "gemini-3.8-flash"
+client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 
-client = None
+# ------------------------------------------
+# 2. CACHE
+# ------------------------------------------
 
-if GEMINI_KEY:
-    client = genai.Client(
-        api_key=GEMINI_KEY
-    )
+CACHE = {}
+CACHE_TTL = 3600
+MAX_CACHE_SIZE = 200
+CACHE_LOCK = threading.Lock()
+
+
+def get_cache(news):
+
+    key = hashlib.sha256(
+        news.lower().strip().encode("utf-8")
+    ).hexdigest()
+
+    with CACHE_LOCK:
+
+        item = CACHE.get(key)
+
+        if item and time.time() - item["time"] < CACHE_TTL:
+            print("CACHE HIT")
+            return item["data"]
+
+        if item:
+            del CACHE[key]
+
+    return None
+
+
+def save_cache(news, result):
+
+    key = hashlib.sha256(
+        news.lower().strip().encode("utf-8")
+    ).hexdigest()
+
+    with CACHE_LOCK:
+
+        if len(CACHE) >= MAX_CACHE_SIZE:
+            oldest = min(
+                CACHE,
+                key=lambda k: CACHE[k]["time"]
+            )
+            del CACHE[oldest]
+
+        CACHE[key] = {
+            "time": time.time(),
+            "data": result
+        }
 
 
 # ------------------------------------------
-# 2. GOOGLE FACT CHECK API
+# 3. GOOGLE FACT CHECK API
 # ------------------------------------------
 
 def get_fact_checks(news):
@@ -56,7 +107,7 @@ def get_fact_checks(news):
         response = requests.get(
             FACT_CHECK_URL,
             params=params,
-            timeout=20
+            timeout=15
         )
 
         response.raise_for_status()
@@ -88,13 +139,13 @@ def get_fact_checks(news):
 
     except requests.exceptions.RequestException as error:
 
-        print("FACT CHECK API ERROR:", repr(error))
+        print("FACT CHECK ERROR:", repr(error))
 
-        return [], "Google Fact Check search was unavailable."
+        return [], "Google Fact Check search is unavailable."
 
 
 # ------------------------------------------
-# 3. EXTRACT GOOGLE SEARCH SOURCES
+# 4. EXTRACT GOOGLE SEARCH SOURCES
 # ------------------------------------------
 
 def extract_sources(response):
@@ -142,65 +193,52 @@ def extract_sources(response):
 
     except Exception as error:
 
-        print("SOURCE EXTRACTION ERROR:", repr(error))
+        print("SOURCE ERROR:", repr(error))
 
     return sources[:8]
 
 
 # ------------------------------------------
-# 4. EXTRACT JSON RESPONSE
+# 5. EXTRACT JSON
 # ------------------------------------------
 
 def extract_json(response_text):
 
     if not response_text:
-        raise ValueError("Empty response received from Gemini.")
+        raise ValueError("Gemini returned an empty response.")
 
-    # Remove Markdown code fences if present
     cleaned = re.sub(
         r"```(?:json)?",
         "",
         response_text,
         flags=re.IGNORECASE
-    ).strip()
-
-    cleaned = cleaned.replace("```", "").strip()
+    ).replace("```", "").strip()
 
     try:
         return json.loads(cleaned)
 
     except json.JSONDecodeError:
 
-        # Find the first valid JSON object
         decoder = json.JSONDecoder()
 
         start = cleaned.find("{")
 
         if start == -1:
-            raise ValueError(
-                "Gemini did not return a valid JSON response."
-            )
+            raise ValueError("Invalid JSON response from Gemini.")
 
-        try:
-            result, _ = decoder.raw_decode(cleaned[start:])
-            return result
+        result, _ = decoder.raw_decode(cleaned[start:])
 
-        except json.JSONDecodeError:
-            raise ValueError(
-                "Unable to extract valid JSON from Gemini response."
-            )
+        return result
 
 
 # ------------------------------------------
-# 5. GEMINI AI NEWS VERIFICATION
+# 6. GEMINI VERIFICATION
 # ------------------------------------------
 
 def verify_with_gemini(news, fact_checks):
 
     if client is None:
-        raise ValueError(
-            "Gemini API key is missing."
-        )
+        raise ValueError("Gemini API key is missing.")
 
     fact_check_data = json.dumps(
         fact_checks,
@@ -210,72 +248,69 @@ def verify_with_gemini(news, fact_checks):
     prompt = f"""
 You are a professional news fact-checking assistant.
 
-Your task is to verify the exact factual statement.
+Verify the exact factual claim below.
 
-NEWS STATEMENT:
+NEWS:
 {news}
 
-EXISTING GOOGLE FACT CHECK RESULTS:
+EXISTING FACT CHECK RESULTS:
 {fact_check_data}
 
 INSTRUCTIONS:
 
-1. Investigate the exact news statement.
-2. Use Google Search grounding to find reliable evidence.
-3. Prefer official government websites and established
-   news organizations.
-4. Compare the claim with available evidence.
-5. Do not confuse a related claim with the exact claim.
-6. Do not blindly trust unrelated fact-check results.
-7. Never invent evidence or source links.
-8. If the information is insufficient, return UNVERIFIED.
+1. Use Google Search grounding.
+2. Prefer official and reliable sources.
+3. Check the exact claim, not merely related topics.
+4. Never invent evidence or links.
+5. Distinguish facts from opinions.
+6. If evidence is insufficient, return UNVERIFIED.
 
-VERDICT RULES:
+VERDICTS:
 
-TRUE:
-Reliable evidence supports the central claim.
+TRUE: Reliable evidence supports the claim.
 
-FAKE:
-Reliable evidence clearly contradicts the central claim.
+FAKE: Reliable evidence contradicts the claim.
 
-UNVERIFIED:
-Evidence is insufficient, ambiguous, or contradictory.
+UNVERIFIED: Evidence is insufficient or ambiguous.
 
-Return ONLY a valid JSON object in this format:
+Return ONLY JSON:
 
 {{
-    "verdict": "TRUE",
-    "confidence": 95,
-    "explanation": "A short explanation based on evidence.",
-    "checked_claim": "The exact claim that was checked"
+    "verdict": "UNVERIFIED",
+    "confidence": 0,
+    "explanation": "Explain the available evidence.",
+    "checked_claim": "The exact claim checked"
 }}
 
-The verdict must be TRUE, FAKE, or UNVERIFIED.
-Confidence must be a number between 0 and 100.
-Do not include Markdown or additional text.
+Confidence must be between 0 and 100.
 """
 
     response = client.models.generate_content(
+
         model=GEMINI_MODEL,
+
         contents=prompt,
+
         config=types.GenerateContentConfig(
+
             tools=[
                 types.Tool(
                     google_search=types.GoogleSearch()
                 )
-            ]
+            ],
+
+            temperature=0.1,
+
+            max_output_tokens=500
         )
     )
 
     response_text = response.text or ""
 
-    print("\n========== GEMINI RAW RESPONSE ==========")
-    print(response_text)
+    print("GEMINI RESPONSE:", response_text)
 
-    # Extract JSON
     result = extract_json(response_text)
 
-    # Validate verdict
     verdict = str(
         result.get("verdict", "UNVERIFIED")
     ).upper().strip()
@@ -283,17 +318,13 @@ Do not include Markdown or additional text.
     if verdict not in ["TRUE", "FAKE", "UNVERIFIED"]:
         verdict = "UNVERIFIED"
 
-    # Validate confidence
     try:
 
         confidence = float(
             result.get("confidence", 0)
         )
 
-        confidence = max(
-            0,
-            min(100, confidence)
-        )
+        confidence = max(0, min(100, confidence))
 
     except (ValueError, TypeError):
 
@@ -310,10 +341,8 @@ Do not include Markdown or additional text.
         result.get("checked_claim", "")
     )
 
-    # Extract Google Search sources
     sources = extract_sources(response)
 
-    # Require search evidence for definite results
     if not sources:
 
         verdict = "UNVERIFIED"
@@ -323,22 +352,25 @@ Do not include Markdown or additional text.
             "Manual verification is recommended."
         )
 
-    # Avoid definite results with low confidence
     if confidence < 70:
-
         verdict = "UNVERIFIED"
 
     return {
+
         "status": verdict,
+
         "confidence": confidence,
+
         "explanation": explanation,
+
         "checked_claim": checked_claim,
+
         "sources": sources
     }
 
 
 # ------------------------------------------
-# 6. HOME PAGE
+# 7. HOME PAGE
 # ------------------------------------------
 
 @app.route("/")
@@ -348,7 +380,7 @@ def home():
 
 
 # ------------------------------------------
-# 7. CHECK NEWS ROUTE
+# 8. CHECK NEWS
 # ------------------------------------------
 
 @app.route("/api/check", methods=["POST"])
@@ -358,7 +390,6 @@ def check_news():
 
     news = str(data.get("news", "")).strip()
 
-    # Validate input
     if len(news) < 10:
 
         return jsonify({
@@ -371,40 +402,35 @@ def check_news():
             "error": "Maximum 3000 characters allowed."
         }), 400
 
-    if not GEMINI_KEY:
+    if not GEMINI_KEY or client is None:
 
         return jsonify({
             "error": "Gemini API key is missing."
         }), 500
 
+    # Check cache first
+
+    cached = get_cache(news)
+
+    if cached:
+
+        cached["cached"] = True
+
+        return jsonify(cached), 200
+
     try:
 
-        # First: Google Fact Check API
         reviews, warning = get_fact_checks(news)
 
-        print("\n========== FACT CHECK RESULTS ==========")
         print("NEWS:", news)
-        print("REVIEWS FOUND:", len(reviews))
+        print("FACT CHECK REVIEWS:", len(reviews))
 
-        for review in reviews:
-
-            print("CLAIM:", review["claim"])
-            print("RATING:", review["rating"])
-            print("PUBLISHER:", review["publisher"])
-
-        # Second: Gemini AI + Google Search
         ai_result = verify_with_gemini(
             news,
             reviews
         )
 
-        print("\n========== GEMINI VERIFICATION ==========")
-        print("VERDICT:", ai_result["status"])
-        print("CONFIDENCE:", ai_result["confidence"])
-        print("EXPLANATION:", ai_result["explanation"])
-        print("SOURCES:", ai_result["sources"])
-
-        return jsonify({
+        result = {
 
             "status": ai_result["status"],
 
@@ -422,9 +448,18 @@ def check_news():
 
             "verification_method": (
                 "Google Fact Check API + Gemini AI + Google Search"
-            )
+            ),
 
-        }), 200
+            "cached": False
+        }
+
+        # Save successful verification
+
+        save_cache(news, result)
+
+        print("VERDICT:", ai_result["status"])
+
+        return jsonify(result), 200
 
     except ValueError as error:
 
@@ -436,18 +471,43 @@ def check_news():
 
     except Exception as error:
 
-        print("VERIFICATION ERROR:", repr(error))
+        print("GEMINI ERROR:", repr(error))
 
         error_text = str(error).lower()
 
-        if "429" in error_text or "resource_exhausted" in error_text:
+        error_code = getattr(error, "code", None)
+
+        if (
+            error_code == 429
+            or "429" in error_text
+            or "resource_exhausted" in error_text
+        ):
 
             return jsonify({
                 "error": (
-                    "Gemini API quota exceeded. "
-                    "Please try again after the quota resets."
+                    "Gemini API quota or rate limit exceeded. "
+                    "Please check Google AI Studio Rate Limits "
+                    "and try again when quota is available."
                 )
             }), 429
+
+        if error_code == 404 or "404" in error_text:
+
+            return jsonify({
+                "error": (
+                    "Gemini model or API resource not found. "
+                    "Check your model name and API configuration."
+                )
+            }), 404
+
+        if error_code == 400 or "400" in error_text:
+
+            return jsonify({
+                "error": (
+                    "Invalid Gemini API request. "
+                    "Check the request configuration."
+                )
+            }), 400
 
         return jsonify({
             "error": (
@@ -458,7 +518,7 @@ def check_news():
 
 
 # ------------------------------------------
-# 8. HEALTH CHECK
+# 9. HEALTH CHECK
 # ------------------------------------------
 
 @app.route("/health")
@@ -470,13 +530,15 @@ def health():
 
         "gemini_configured": bool(GEMINI_KEY),
 
-        "fact_check_configured": bool(FACT_CHECK_KEY)
+        "fact_check_configured": bool(FACT_CHECK_KEY),
+
+        "model": GEMINI_MODEL
 
     })
 
 
 # ------------------------------------------
-# 9. RUN APPLICATION
+# 10. RUN APPLICATION
 # ------------------------------------------
 
 if __name__ == "__main__":
